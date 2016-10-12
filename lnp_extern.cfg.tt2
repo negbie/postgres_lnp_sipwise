@@ -1,0 +1,151 @@
+[% argv.role='lb'; argv.type='sip_int';
+    PROCESS '/usr/lib/ngcp-ngcpcfg/get_all_shared_ips';
+    sip_lb_ips = out;
+    
+    IF !sip_lb_ips.size;
+        PROCESS '/usr/lib/ngcp-ngcpcfg/get_all_ips';
+        sip_lb_ips = out;
+    END;
+-%]
+[% IF rsyslog.elasticsearch.enable == "yes" -%]
+[% elasticsearch_template='S=$rs SS=\'$rr\' M=$rm R=$ru F=$fu T=$tu IP=$avp(s:ip):$avp(s:port)($si:$sp) UAIP=$si UA=\'$ua\' ID=$ci ' -%]
+[% logreq_init=elasticsearch_template -%]
+[% logreq=elasticsearch_template -%]
+[% logres_init=elasticsearch_template -%]
+[% logres=elasticsearch_template -%]
+[% ELSE -%]
+[% MACRO logreq_init GET kamailio.proxy.log.request_init.join(' ') -%]
+[% MACRO logreq GET kamailio.proxy.log.request.join(' ') -%]
+[% MACRO logres_init GET kamailio.proxy.log.response_init.join(' ') -%]
+[% MACRO logres GET kamailio.proxy.log.response.join(' ') -%]
+[% END -%]
+# Database configuration
+loadmodule "db_postgres.so"
+modparam("db_postgres", "retries", 3)
+modparam("db_postgres", "timeout", 5)
+modparam("db_postgres", "tcp_keepalive", 60)
+
+loadmodule "db_cluster.so"
+modparam("db_cluster", "connection", "lnpcon1=>postgres://USER:PW@postgres_db_server")
+modparam("db_cluster", "connection", "lnpcon2=>postgres://USER:PW@postgres_db_server")
+modparam("db_cluster", "inactive_interval", 5)
+# first two are read (prio 9, round-robin); second two are write (prio 9, parallel - not used)
+modparam("db_cluster", "cluster", "lnpcluster=>lnpcon1=9r9p;lnpcon2=9r9p")
+loadmodule "sqlops.so"
+modparam("sqlops","sqlcon","lnpcon=>cluster://lnpcluster")
+
+route[ROUTE_LNP]
+{
+  if($avp(s:from_pbx)==1)
+  {
+    xlog("L_INFO", "Skip LNP request for call loop from PBX - [% logreq -%]\n");
+    return;
+  }
+
+  $var(lnp_a_number) = $avp(s:caller_cli_netprov);
+  $var(lnp_b_number) = $avp(s:acc_callee_user_in);
+
+  if(!pv_isset("$avp(s:lua_dlg_callid)")) $avp(s:lua_dlg_callid) = $ci;
+    [% whitelist = [];
+    blacklist = []; 
+    FOREACH pattern IN kamailio.proxy.lnp.api.lnp_request_whitelist;
+      whitelist.push('$var(lnp_b_number) =~ "' _ pattern _ '"');
+    END;
+    FOREACH pattern IN kamailio.proxy.lnp.api.lnp_request_blacklist;
+      blacklist.push('$var(lnp_b_number) =~ "' _ pattern _ '"');
+    END-%]
+    
+  if($var(lnp_b_number) != 0[%- IF whitelist.size -%] && ([% whitelist.join(' || ') %])[% END -%]
+    [%- IF blacklist.size -%] && !([% blacklist.join(' || ') %])[% END -%])
+  {             
+    xlog("L_NOTICE", "Dispatch LNP request for a/b-number '$var(lnp_a_number)/$var(lnp_b_number)' - [% logreq -%]\n");
+  }
+  else
+  {             
+    xlog("L_NOTICE", "Skip LNP request for a/b-number '$var(lnp_a_number)/$var(lnp_b_number)' - [% logreq -%]\n");
+    return;
+  }
+  route(ROUTE_LNP_RESULT);
+  return;
+}
+
+route[ROUTE_LNP_RESULT] {
+
+  $var(lnp_clir) = "false";
+  if($avp(s:caller_clir) == 1) {
+    $var(lnp_clir) = "true";
+  }
+  
+  if ($avp(s:caller_cli_netprov) =~ "^\+") {
+    $var(lnp_a_number) = $avp(s:caller_cli_netprov);
+  }
+  else {
+    $var(lnp_a_number) = $_s(+$avp(s:caller_cli_netprov));
+  }
+  if ($avp(s:acc_callee_user_in) =~ "^\+") {
+    $var(lnp_b_number) = $avp(s:acc_callee_user_in);
+  }
+  else {
+    $var(lnp_b_number) = $_s(+$avp(s:acc_callee_user_in));
+  }
+
+  if($var(lnp_a_number) == '+unavailable') {
+    $var(lnp_a_number) = '';
+  }
+
+  sql_query("lnpcon", "select np_service('$var(lnp_a_number)', null, '$var(lnp_b_number)', null, '$si', $var(lnp_clir), 0)", "lnp");
+  $var(lnp_dst) = $dbr(lnp=>[0,0]);
+
+  xlog("L_NOTICE", "LNP: select returned $dbr(lnp=>rows) rows, first is $dbr(lnp=>[0,0]) - ID=$ci\n");
+
+  if($dbr(lnp=>rows) > 0) {
+    $var(lnp_indicator) = $(var(lnp_dst){s.substr,0,5});
+    if($var(lnp_dst) == "SOME_PREFIX_TO_SKIP")
+    {
+      xlog("L_NOTICE", "LNP: skipped (SOME_PREFIX_TO_SKIP) - ID=$ci\n");
+      return;
+    }
+    else
+    {
+      $var(lnp_dst)= $var(lnp_dst) + $avp(s:acc_callee_user_in);
+      xlog("L_NOTICE", "LNP_DST: $var(lnp_dst)! NOW LETS BUILD SOMETHING FANCY!\n");
+    }
+  } 
+
+  if ($var(lnp_dst) != 0) {
+    [% lnp_announce_codes = [];
+       FOREACH pattern IN kamailio.proxy.lnp.api.invalid_lnp_routing_codes;
+        lnp_announce_codes.push('$var(lnp_dst) =~ "' _ pattern _ '"');
+       END;-%]
+       [%- IF lnp_announce_codes.size -%] if([% lnp_announce_codes.join(' || ') %])
+    {
+      xlog("L_NOTICE", "Call to invalid LNP routing code '$var(lnp_dst)' - [% logreq -%]\n");
+
+      $var(announce_handle) = "callee_unknown";
+      $var(announce_set) = $xavp(caller_real_prefs[0]=>sound_set);
+      $(avp(s:announce_code)[*]) = [% kamailio.proxy.early_rejects.callee_unknown.announce_code %];
+      $(avp(s:announce_reason)[*]) = "[% kamailio.proxy.early_rejects.callee_unknown.announce_code %]";
+      route(ROUTE_ACC_FAILURE);
+      route(ROUTE_EARLY_REJECT);
+    }
+    [% END -%]
+    xlog("L_NOTICE", "LNP routing number $var(lnp_dst) found, replacing called party - [% logreq -%]\n");
+    route(ROUTE_LNP_SET_URI);
+  }
+  else {
+    xlog("L_NOTICE", "No LNP entry found for '$var(lnp_a_number)/$var(lnp_b_number)' - [% logreq -%]\n");
+    route(ROUTE_LNP_SET_PARAMS);
+  }
+  route(ROUTE_FIND_CALLEE_POST);
+  return;
+}
+########################################################################
+
+########################################################################
+# Check for LNP in NCOS lists (-1 if blocked, 1 if passed)
+########################################################################
+route[ROUTE_NCOS_LNP_CHECK] {
+  xlog("L_INFO", "NCOS LNP check passed - [% logreq -%]\n");
+  return(1);
+}
+########################################################################
